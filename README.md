@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/sourcegate-mcp-fathom-server-badge.png)](https://mseep.ai/app/sourcegate-mcp-fathom-server)
+
 # MCP Fathom Server
 
 An MCP (Model Context Protocol) server that integrates with Fathom AI's meeting API, enabling Claude to search and retrieve meeting information through natural language queries.
