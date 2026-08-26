@@ -24,16 +24,19 @@ const ListMeetingsSchema = z.object({
   calendar_invitees_domains: z.array(z.string()).optional().describe("Filter by company domains"),
   created_after: z.string().optional().describe("Filter meetings created after this date (ISO 8601)"),
   created_before: z.string().optional().describe("Filter meetings created before this date (ISO 8601)"),
-  include_transcript: z.boolean().optional().default(false).describe("Include meeting transcripts"),
+  include_transcript: z.boolean().optional().default(false).describe("Include full speaker-attributed transcripts"),
+  include_summary: z.boolean().optional().default(false).describe("Include AI summary and action items"),
   meeting_type: z.enum(['all', 'internal', 'external']).optional().default('all').describe("Filter by meeting type"),
   recorded_by: z.array(z.string()).optional().describe("Filter by meeting owner email addresses"),
   teams: z.array(z.string()).optional().describe("Filter by team names"),
-  limit: z.number().optional().default(50).describe("Maximum number of meetings to return")
+  limit: z.number().optional().default(50).describe("Maximum number of meetings to return (paginates automatically)")
 });
 
 const SearchMeetingsSchema = z.object({
   search_term: z.string().describe("Search term to find in meeting titles, summaries, or action items"),
-  include_transcript: z.boolean().optional().default(false).describe("Whether to search within transcripts (WARNING: Currently disabled for performance)")
+  include_transcript: z.boolean().optional().default(false).describe("Also search within full transcripts (slower)"),
+  days_back: z.number().optional().default(30).describe("How many days back to search"),
+  limit: z.number().optional().default(50).describe("Maximum number of meetings to return")
 });
 
 const apiKey = process.env.FATHOM_API_KEY;
@@ -45,6 +48,21 @@ if (!apiKey) {
 }
 
 const fathomClient = new FathomClient(apiKey);
+
+function formatMeeting(meeting: any, includeTranscript?: boolean) {
+  return {
+    title: meeting.title || meeting.meeting_title,
+    date: meeting.scheduled_start_time || meeting.created_at,
+    url: meeting.share_url || meeting.url,
+    recording_id: meeting.recording_id,
+    is_external: meeting.calendar_invitees_domains_type === 'one_or_more_external',
+    attendees: meeting.calendar_invitees,
+    recorded_by: meeting.recorded_by,
+    summary: meeting.default_summary,
+    action_items: meeting.action_items,
+    transcript: includeTranscript ? meeting.transcript : undefined
+  };
+}
 
 const server = new Server({
   name: "mcp-fathom-server",
@@ -89,59 +107,47 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       const params = ListMeetingsSchema.parse(args);
       const limit = params.limit || 50;
       const { limit: _, ...apiParams } = params;
-      
-      console.error(`[list_meetings] Fetching meetings with params:`, JSON.stringify(apiParams));
-      const response = await fathomClient.listMeetings(apiParams);
-      console.error(`[list_meetings] Got ${response.items.length} meetings`);
-      const meetings = response.items.slice(0, limit);
-      
-      const formattedMeetings = meetings.map(meeting => ({
-        title: meeting.title || meeting.meeting_title,
-        date: meeting.scheduled_start_time || meeting.created_at,
-        url: meeting.share_url || meeting.url,
-        attendees: meeting.calendar_invitees,
-        recorded_by: meeting.recorded_by,
-        summary: meeting.default_summary,
-        action_items: meeting.action_items,
-        transcript: params.include_transcript ? meeting.transcript : undefined
-      }));
-      
+
+      console.error(`[list_meetings] params:`, JSON.stringify(apiParams), `limit=${limit}`);
+      const { items, pagesFetched, exhausted } = await fathomClient.listMeetings(apiParams, limit);
+      console.error(`[list_meetings] ${items.length} meetings over ${pagesFetched} page(s), exhausted=${exhausted}`);
+
+      const formattedMeetings = items.map(meeting => formatMeeting(meeting, params.include_transcript));
+
       return {
         content: [{
           type: "text",
           text: JSON.stringify({
-            total_found: response.items.length,
-            showing: meetings.length,
-            meetings: formattedMeetings,
-            has_more: !!response.next_cursor
+            total_found: items.length,
+            showing: items.length,
+            pages_fetched: pagesFetched,
+            corpus_exhausted: exhausted,
+            meetings: formattedMeetings
           }, null, 2)
         }]
       };
     }
-    
+
     if (name === "search_meetings") {
       const params = SearchMeetingsSchema.parse(args);
-      
-      console.error(`[search_meetings] Searching for: "${params.search_term}" (transcript=${params.include_transcript})`);
+
+      console.error(`[search_meetings] "${params.search_term}" transcript=${params.include_transcript} days=${params.days_back}`);
       const meetings = await fathomClient.searchMeetings(
-        params.search_term, 
-        params.include_transcript
+        params.search_term,
+        params.include_transcript,
+        params.days_back,
+        params.limit
       );
-      console.error(`[search_meetings] Found ${meetings.length} matching meetings`);
-      
+      console.error(`[search_meetings] ${meetings.length} matches`);
+
       const formattedMeetings = meetings.map(meeting => ({
-        title: meeting.title || meeting.meeting_title,
-        date: meeting.scheduled_start_time || meeting.created_at,
-        url: meeting.share_url || meeting.url,
-        attendees: meeting.calendar_invitees,
-        recorded_by: meeting.recorded_by,
-        summary: meeting.default_summary,
-        action_items: meeting.action_items,
-        relevance: params.include_transcript && meeting.transcript?.toLowerCase().includes(params.search_term.toLowerCase()) 
-          ? "Found in transcript" 
+        ...formatMeeting(meeting, params.include_transcript),
+        relevance: params.include_transcript &&
+          FathomClient.transcriptText(meeting).toLowerCase().includes(params.search_term.toLowerCase())
+          ? "Found in transcript"
           : "Found in title/summary"
       }));
-      
+
       return {
         content: [{
           type: "text",
@@ -153,7 +159,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         }]
       };
     }
-    
+
     throw new Error(`Unknown tool: ${name}`);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
